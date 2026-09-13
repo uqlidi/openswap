@@ -946,6 +946,18 @@ impl Wallet {
         let signed_contract_tx = match swapcoin.create_signed_contract_tx() {
             Ok(tx) => tx,
             Err(e) => {
+                // An unsignable contract can never reach the chain. Retrying
+                // only makes sense while the funding tx could still confirm and
+                // put coins behind it; once it cannot, nothing was locked.
+                if swapcoin.protocol == crate::protocol::ProtocolVersion::Legacy
+                    && Self::funding_tx_can_never_confirm(chain, swap_id, swapcoin)
+                {
+                    log::info!(
+                        "Contract tx for {} can never be signed and its funding tx conflicts with a confirmed spend, discarding swapcoin",
+                        swap_id
+                    );
+                    return Ok(ContractChainState::Discarded);
+                }
                 log::warn!(
                     "Failed to sign contract tx for {}: {:?} — skipping recovery",
                     swap_id,
@@ -982,6 +994,75 @@ impl Wallet {
             signed_contract_tx.compute_txid()
         );
         Ok(ContractChainState::OnChain)
+    }
+
+    /// Whether a Legacy swapcoin's funding tx can never confirm.
+    ///
+    /// True only when the funding tx is neither mined nor in the mempool and
+    /// one of its inputs has a confirmed spend, which then has to be a
+    /// different transaction. A funding tx that is merely unknown is not
+    /// enough: it may not have been broadcast yet, or may have been evicted
+    /// and still confirm, and discarding the swapcoin would lose the key to
+    /// its multisig output.
+    ///
+    /// A failed query answers `false`, which leaves the swapcoin for the next
+    /// recovery pass.
+    fn funding_tx_can_never_confirm(
+        chain: &AnyBlockchain,
+        swap_id: &str,
+        swapcoin: &super::swapcoin::OutgoingSwapCoin,
+    ) -> bool {
+        let Some(funding_tx) = swapcoin.funding_tx.as_ref() else {
+            return false;
+        };
+        let funding_txid = funding_tx.compute_txid();
+        match chain.is_tx_unknown(&funding_txid) {
+            Ok(true) => {}
+            Ok(false) => return false,
+            Err(e) => {
+                log::debug!(
+                    "Could not look up funding tx {} for {}: {:?}",
+                    funding_txid,
+                    swap_id,
+                    e
+                );
+                return false;
+            }
+        }
+
+        funding_tx.input.iter().any(|input| {
+            let prevout = input.previous_output;
+            // Electrum answers from the script's history, so the prevout's
+            // scriptPubKey is needed. Core runs with -txindex, so both backends
+            // can fetch the previous transaction.
+            let script = match chain.get_raw_transaction(&prevout.txid, None) {
+                Ok(prev_tx) => match prev_tx.output.get(prevout.vout as usize) {
+                    Some(output) => output.script_pubkey.clone(),
+                    None => return false,
+                },
+                Err(e) => {
+                    log::debug!(
+                        "Could not look up funding input {} for {}: {:?}",
+                        prevout,
+                        swap_id,
+                        e
+                    );
+                    return false;
+                }
+            };
+            match chain.is_confirmed_spend(&prevout, &script) {
+                Ok(spent) => spent,
+                Err(e) => {
+                    log::debug!(
+                        "Could not check funding input {} for {}: {:?}",
+                        prevout,
+                        swap_id,
+                        e
+                    );
+                    false
+                }
+            }
+        })
     }
 
     /// Attempt to recover timelocked outgoing swapcoins.
